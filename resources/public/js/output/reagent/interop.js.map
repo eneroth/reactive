@@ -1,0 +1,7 @@
+{"version":3,
+ "file":
+ "/Users/henrik/Documents/Projects/Programming/reactive/resources/public/js/output/reagent/interop.js",
+ "sources":["interop.cljs?rel=1418725958526"],
+ "lineCount":6,
+ "mappings":";AAAA;;AAEA,wBAAA,xBAAKA",
+ "names":["reagent.interop/fvars"]}

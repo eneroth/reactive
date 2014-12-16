@@ -1,5 +1,69 @@
 (ns reagent.impl.util
-  (:require [reagent.debug :refer-macros [dbg]]))
+  (:require [reagent.debug :refer-macros [dbg log]]
+            [reagent.interop :refer-macros [.' .!]]
+            [clojure.string :as string]))
+
+(def is-client (and (exists? js/window)
+                    (-> js/window (.' :document) nil? not)))
+
+;;; Props accessors
+
+(defn extract-props [v]
+  (let [p (nth v 1 nil)]
+    (if (map? p) p)))
+
+(defn extract-children [v]
+  (let [p (nth v 1 nil)
+        first-child (if (or (nil? p) (map? p)) 2 1)]
+    (if (> (count v) first-child)
+      (subvec v first-child))))
+
+(defn get-argv [c]
+  (.' c :props.argv))
+
+(defn get-props [c]
+  (-> (.' c :props.argv) extract-props))
+
+(defn get-children [c]
+  (-> (.' c :props.argv) extract-children))
+
+(defn reagent-component? [c]
+  (-> (.' c :props.argv) nil? not))
+
+(defn cached-react-class [c]
+  (.' c :cljsReactClass))
+
+(defn cache-react-class [c constructor]
+  (.! c :cljsReactClass constructor))
+
+;; Misc utilities
+
+(defn memoize-1 [f]
+  (let [mem (atom {})]
+    (fn [arg]
+      (let [v (get @mem arg)]
+        (if-not (nil? v)
+          v
+          (let [ret (f arg)]
+            (swap! mem assoc arg ret)
+            ret))))))
+
+(def dont-camel-case #{"aria" "data"})
+
+(defn capitalize [s]
+  (if (< (count s) 2)
+    (string/upper-case s)
+    (str (string/upper-case (subs s 0 1)) (subs s 1))))
+
+(defn dash-to-camel [dashed]
+  (if (string? dashed)
+    dashed
+    (let [name-str (name dashed)
+          [start & parts] (string/split name-str #"-")]
+      (if (dont-camel-case start)
+        name-str
+        (apply str start (map capitalize parts))))))
+
 
 (deftype partial-ifn [f args ^:mutable p]
   IFn
@@ -35,42 +99,89 @@
       (assert (map? p1))
       (merge-style p1 (merge-class p1 (merge p1 p2))))))
 
-(defn identical-parts [v1 v2]
-  ;; Compare two vectors using identical?
-  (or (identical? v1 v2)
-      (let [end (count v1)]
-        (and (== end (count v2))
-             (loop [n 0]
-               (if (>= n end)
-                 true
-                 (if (identical? (nth v1 n) (nth v2 n))
-                   (recur (inc n))
-                   false)))))))
 
-(def -not-found (js-obj))
+(def ^:dynamic *always-update* false)
 
-(defn shallow-equal-maps [x y]
-  ;; Compare two maps, using keyword-identical? on all values
-  (or (identical? x y)
-      (and (map? x)
-           (map? y)
-           (== (count x) (count y))
-           (reduce-kv (fn [res k v]
-                        (let [yv (get y k -not-found)]
-                          (if (or (keyword-identical? v yv)
-                                  ;; Allow :style maps, symbols
-                                  ;; and reagent/partial
-                                  ;; to be compared properly
-                                  (and (keyword-identical? k :style)
-                                       (shallow-equal-maps v yv))
-                                  (and (or (identical? (type v) partial-ifn)
-                                           (symbol? v))
-                                       (= v yv)))
-                            res
-                            (reduced false))))
-                      true x))))
+(defonce roots (atom {}))
 
-(defn equal-args [p1 c1 p2 c2]
-  [p1 c1 p2 c2]
-  (and (identical-parts c1 c2)
-       (shallow-equal-maps p1 p2)))
+(defn clear-container [node]
+  ;; If render throws, React may get confused, and throw on
+  ;; unmount as well, so try to force React to start over.
+  (try
+    (.' js/React unmountComponentAtNode node)
+    (catch js/Object e
+      (do (log "Error unmounting:")
+          (log e)))))
+
+(defn render-component [comp container callback]
+  (try
+    (binding [*always-update* true]
+      (.' js/React render (comp) container
+          (fn []
+            (binding [*always-update* false]
+              (swap! roots assoc container [comp container])
+              (if (some? callback)
+                (callback))))))
+    (catch js/Object e
+      (do (clear-container container)
+          (throw e)))))
+
+(defn re-render-component [comp container]
+  (render-component comp container nil))
+
+(defn unmount-component-at-node [container]
+  (swap! roots dissoc container)
+  (.' js/React unmountComponentAtNode container))
+
+(defn force-update-all []
+  (doseq [v (vals @roots)]
+    (apply re-render-component v))
+  "Updated")
+
+
+;;; Wrapper
+
+(deftype Wrapper [^:mutable state callback ^:mutable changed]
+
+  IAtom
+
+  IDeref
+  (-deref [this] state)
+
+  IReset
+  (-reset! [this newval]
+           (set! changed true)
+           (set! state newval)
+           (callback newval)
+           state)
+
+  ISwap
+  (-swap! [a f]
+    (-reset! a (f state)))
+  (-swap! [a f x]
+    (-reset! a (f state x)))
+  (-swap! [a f x y]
+    (-reset! a (f state x y)))
+  (-swap! [a f x y more]
+    (-reset! a (apply f state x y more)))
+
+  IEquiv
+  (-equiv [_ other]
+          (and (instance? Wrapper other)
+               ;; If either of the wrappers have changed, equality
+               ;; cannot be relied on.
+               (not changed)
+               (not (.-changed other))
+               (= state (.-state other))
+               (= callback (.-callback other))))
+
+  IPrintWithWriter
+  (-pr-writer [_ writer opts]
+    (-write writer "#<wrap: ")
+    (pr-writer state writer opts)
+    (-write writer ">")))
+
+(defn make-wrapper [value callback-fn args]
+  (Wrapper. value
+            (partial-ifn. callback-fn args nil)
+            false))
