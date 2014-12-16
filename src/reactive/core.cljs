@@ -8,11 +8,11 @@
   (:require-macros [cljs.core.async.macros :refer [go go-loop]]
                    [reactive.macros :refer [sleep keep-going]]))
 
+
 ;; State
 ;; -------------------------------
 (def app-state (atom {:coords {:x 0
                                :y 0}}))
-
 
 ;; Logic
 ;; -------------------------------
